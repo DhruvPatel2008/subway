@@ -311,9 +311,6 @@ let searchQ     = '';
 let filterCat   = 'All';
 let pendingCat  = null;
 let pendingItem = null;
-let fbReady        = false; // true once Firebase has given us its first snapshot
-let pendingDeletes = new Set(); // IDs deleted locally but not yet confirmed by Firebase
-
 // ============================================================
 // HELPERS
 // ============================================================
@@ -339,6 +336,9 @@ function saveLocal(data) {
 
 // ============================================================
 // FIREBASE INIT
+// Uses child_added / child_removed / child_changed listeners.
+// These fire ONE item at a time — no full snapshots, no race conditions.
+// Deleting an item fires child_removed exactly once. Done.
 // ============================================================
 function initFirebase() {
   if (FIREBASE_CONFIG.apiKey.includes('PASTE_YOUR')) {
@@ -347,12 +347,12 @@ function initFirebase() {
     logs = loadLocal(); render(); return;
   }
   if (!FIREBASE_CONFIG.databaseURL || !FIREBASE_CONFIG.databaseURL.includes('firebaseio')) {
-    showBanner('<code>databaseURL</code> is missing or wrong. Copy it from Firebase Console → Realtime Database. It looks like <code>https://your-project-default-rtdb.firebaseio.com</code>');
+    showBanner('<code>databaseURL</code> is missing or wrong.');
     setSyncStatus('error', 'BAD databaseURL');
     logs = loadLocal(); render(); return;
   }
 
-  // Show local data immediately while Firebase loads — no blank screen
+  // Show local data immediately so screen is never blank while Firebase loads
   logs = loadLocal();
   render();
   setSyncStatus('', 'CONNECTING...');
@@ -360,59 +360,60 @@ function initFirebase() {
   try {
     firebase.initializeApp(FIREBASE_CONFIG);
     db = firebase.database();
+    const logsRef = db.ref('logs');
 
-
-    // ── Real-time listener ────────────────────────────────────
-    // Fires on page load AND whenever ANY device adds/removes something
-    db.ref('logs').on('value', snap => {
-      const fbData = snap.val() || {};
-      const local  = loadLocal();
-
-      // Strip out any IDs we've already deleted locally —
-      // Firebase may still have them for a split second after .remove() is called.
-      // Once Firebase confirms deletion (item absent from fbData), clear from set.
-      pendingDeletes.forEach(id => {
-        if (!fbData[id]) pendingDeletes.delete(id); // Firebase confirmed it's gone
-        delete fbData[id]; // hide it from our view until Firebase catches up
-      });
-
-      // Push any local-only items up to Firebase so they sync
-      Object.keys(local).forEach(id => {
-        if (!fbData[id] && !pendingDeletes.has(id)) {
-          db.ref('logs/' + id).set(local[id]).catch(() => {});
-        }
-      });
-
-      if (!fbReady) {
-        // First load: merge Firebase + local so nothing disappears
-        logs = Object.assign({}, fbData, local);
-        // Remove any pending-delete items from the merged result too
-        pendingDeletes.forEach(id => delete logs[id]);
-        fbReady = true;
-      } else {
-        // Subsequent updates: Firebase is master, but respect pending deletes
-        logs = fbData;
-      }
-
+    // child_added fires once per existing item on connect, then for each new item.
+    // We merge into logs so locally-added items are never overwritten.
+    logsRef.on('child_added', snap => {
+      const item = snap.val();
+      if (!item) return;
+      logs[item.id] = item;        // add/overwrite this one item only
       saveLocal(logs);
       render();
-    }, err => {
-      console.error(err);
+    });
+
+    // child_changed fires when an item is edited (e.g. time corrected).
+    logsRef.on('child_changed', snap => {
+      const item = snap.val();
+      if (!item) return;
+      logs[item.id] = item;
+      saveLocal(logs);
+      render();
+    });
+
+    // child_removed fires ONCE when an item is deleted — no race, no flicker.
+    // The item is simply removed from logs and the screen updates.
+    logsRef.on('child_removed', snap => {
+      const item = snap.val();
+      if (!item) return;
+      delete logs[item.id];
+      saveLocal(logs);
+      render();
+    });
+
+    // Connection indicator
+    db.ref('.info/connected').on('value', snap => {
+      if (snap.val() === true) {
+        hideBanner();
+        setSyncStatus('connected', 'SYNCED — LIVE ✓');
+        // Upload any local-only items that weren't in Firebase yet
+        const local = loadLocal();
+        Object.values(local).forEach(entry => {
+          db.ref('logs/' + entry.id).once('value').then(s => {
+            if (!s.exists()) db.ref('logs/' + entry.id).set(entry).catch(() => {});
+          });
+        });
+      } else {
+        setSyncStatus('', 'OFFLINE — changes save when reconnected');
+      }
+    });
+
+    logsRef.on('cancel', err => {
       const msg = err.code === 'PERMISSION_DENIED'
         ? 'Permission denied. Go to Firebase Console → Realtime Database → Rules → set <code>"read": true, "write": true</code> and click Publish.'
         : 'Sync error: ' + err.message;
       showBanner(msg);
       setSyncStatus('error', 'SYNC ERROR');
-    });
-
-    // ── Connection indicator ──────────────────────────────────
-    db.ref('.info/connected').on('value', snap => {
-      if (snap.val() === true) {
-        hideBanner();
-        setSyncStatus('connected', 'SYNCED — LIVE ✓');
-      } else {
-        setSyncStatus('', 'OFFLINE — changes save when reconnected');
-      }
     });
 
   } catch (err) {
@@ -422,19 +423,18 @@ function initFirebase() {
 }
 
 // ============================================================
-// ADD / DELETE  — always write to Firebase immediately
-// (Firebase SDK queues the write if offline and sends it when back online)
+// ADD / DELETE
 // ============================================================
 function addLog(cat, item, state) {
   const id    = 'log_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
   const entry = { id, cat, name: item.n, state: state.l, hours: state.h, loggedAt: Date.now() };
 
-  // 1. Update screen instantly
+  // Update screen instantly
   logs[id] = entry;
   saveLocal(logs);
   render();
 
-  // 2. Write to Firebase unconditionally — SDK queues if offline
+  // Write to Firebase — child_added listener on other devices will pick this up
   if (db) {
     db.ref('logs/' + id).set(entry).catch(err => console.error('Write error:', err));
   }
@@ -444,24 +444,16 @@ function addLog(cat, item, state) {
 }
 
 function deleteLog(id) {
-  // 1. Mark as pending delete BEFORE removing — the Firebase listener
-  //    checks this set and won't re-add the item when it next fires.
-  pendingDeletes.add(id);
-
-  // 2. Remove from local state and screen instantly
+  // Remove from local state and screen RIGHT NOW — no waiting
   delete logs[id];
   saveLocal(logs);
   render();
 
-  // 3. Remove from Firebase — once confirmed, listener clears it from pendingDeletes
+  // Tell Firebase to delete — child_removed fires on all OTHER devices.
+  // On THIS device we already removed it above, so child_removed just
+  // tries to delete an already-absent key which is harmless.
   if (db) {
-    db.ref('logs/' + id).remove().catch(err => {
-      console.error('Delete error:', err);
-      pendingDeletes.delete(id); // rollback if Firebase delete failed
-    });
-  } else {
-    // No Firebase — clear immediately
-    pendingDeletes.delete(id);
+    db.ref('logs/' + id).remove().catch(err => console.error('Delete error:', err));
   }
 }
 
