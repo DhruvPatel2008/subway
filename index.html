@@ -93,6 +93,23 @@
   .row-exp{font-size:9px;color:var(--muted);margin-top:3px;}
   .del-btn{background:var(--surface2);border:1px solid var(--border);color:var(--muted);width:28px;height:28px;border-radius:7px;cursor:pointer;font-size:13px;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:all 0.12s;}
   .del-btn:hover{background:var(--red-bg);color:var(--red);border-color:var(--red);}
+  .edit-btn{background:var(--surface2);border:1px solid var(--border);color:var(--muted);width:28px;height:28px;border-radius:7px;cursor:pointer;font-size:12px;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:all 0.12s;}
+  .edit-btn:hover{background:#0d1f2d;color:#3a9bd5;border-color:#3a9bd5;}
+  .row-btns{display:flex;gap:5px;flex-shrink:0;}
+
+  /* EDIT MODAL */
+  #edit-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:300;align-items:flex-end;justify-content:center;}
+  #edit-overlay.open{display:flex;}
+  #edit-modal{background:#111;border:1px solid #222;border-radius:20px 20px 0 0;width:100%;max-width:680px;padding:24px;animation:slideUp 0.25s ease;}
+  #edit-item-name{font-family:"Bebas Neue",sans-serif;font-size:20px;letter-spacing:2px;margin-bottom:4px;color:#3a9bd5;}
+  #edit-item-sub{font-size:11px;color:var(--muted);margin-bottom:20px;}
+  .edit-label{font-size:11px;color:var(--muted);letter-spacing:1px;margin-bottom:6px;}
+  #edit-datetime{width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:12px 14px;font-family:"DM Mono",monospace;font-size:14px;outline:none;margin-bottom:12px;}
+  #edit-datetime:focus{border-color:#3a9bd5;}
+  .edit-preview{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:12px 14px;margin-bottom:20px;font-size:12px;color:var(--muted);line-height:2;}
+  #edit-save{width:100%;padding:14px;background:#3a9bd5;color:#fff;border:none;border-radius:12px;font-family:"DM Mono",monospace;font-size:14px;font-weight:500;cursor:pointer;margin-bottom:8px;transition:opacity 0.15s;}
+  #edit-save:hover{opacity:0.85;}
+  #edit-cancel-btn{width:100%;padding:13px;background:transparent;border:1px solid var(--border);color:var(--muted);border-radius:12px;font-family:"DM Mono",monospace;font-size:13px;cursor:pointer;}
 
   /* EMPTY */
   .empty{padding:48px 20px;text-align:center;color:var(--muted);}
@@ -180,6 +197,20 @@
     <div id="modal-sub">Select the current state of this item</div>
     <div id="modal-states"></div>
     <button id="modal-cancel" onclick="closeModal()">Cancel</button>
+  </div>
+</div>
+
+<!-- Edit Date/Time Modal -->
+<div id="edit-overlay">
+  <div id="edit-modal">
+    <div style="font-size:24px;margin-bottom:8px" id="edit-modal-icon"></div>
+    <div id="edit-item-name"></div>
+    <div id="edit-item-sub"></div>
+    <div class="edit-label">WHEN DID YOU OPEN / PREP THIS?</div>
+    <input type="datetime-local" id="edit-datetime" oninput="updateEditPreview()"/>
+    <div class="edit-preview" id="edit-preview"></div>
+    <button id="edit-save" onclick="saveEdit()">✓ Save New Time</button>
+    <button id="edit-cancel-btn" onclick="closeEditModal()">Cancel</button>
   </div>
 </div>
 
@@ -280,7 +311,8 @@ let searchQ     = '';
 let filterCat   = 'All';
 let pendingCat  = null;
 let pendingItem = null;
-let fbReady     = false; // true once Firebase has given us its first snapshot
+let fbReady        = false; // true once Firebase has given us its first snapshot
+let pendingDeletes = new Set(); // IDs deleted locally but not yet confirmed by Firebase
 
 // ============================================================
 // HELPERS
@@ -333,27 +365,35 @@ function initFirebase() {
     // ── Real-time listener ────────────────────────────────────
     // Fires on page load AND whenever ANY device adds/removes something
     db.ref('logs').on('value', snap => {
-      const fbData  = snap.val() || {};
-      const local   = loadLocal();
+      const fbData = snap.val() || {};
+      const local  = loadLocal();
 
-      // MERGE: combine Firebase data + any local-only items
-      // Local items that haven't reached Firebase yet are preserved
-      const merged  = Object.assign({}, fbData, local);
+      // Strip out any IDs we've already deleted locally —
+      // Firebase may still have them for a split second after .remove() is called.
+      // Once Firebase confirms deletion (item absent from fbData), clear from set.
+      pendingDeletes.forEach(id => {
+        if (!fbData[id]) pendingDeletes.delete(id); // Firebase confirmed it's gone
+        delete fbData[id]; // hide it from our view until Firebase catches up
+      });
 
       // Push any local-only items up to Firebase so they sync
       Object.keys(local).forEach(id => {
-        if (!fbData[id]) {
+        if (!fbData[id] && !pendingDeletes.has(id)) {
           db.ref('logs/' + id).set(local[id]).catch(() => {});
         }
       });
 
-      // Firebase is now the master copy
-      logs = fbData; // after upload, Firebase will fire again with merged data
       if (!fbReady) {
-        // First load: use merged so nothing disappears
-        logs = merged;
+        // First load: merge Firebase + local so nothing disappears
+        logs = Object.assign({}, fbData, local);
+        // Remove any pending-delete items from the merged result too
+        pendingDeletes.forEach(id => delete logs[id]);
         fbReady = true;
+      } else {
+        // Subsequent updates: Firebase is master, but respect pending deletes
+        logs = fbData;
       }
+
       saveLocal(logs);
       render();
     }, err => {
@@ -404,14 +444,24 @@ function addLog(cat, item, state) {
 }
 
 function deleteLog(id) {
-  // 1. Remove from screen instantly
+  // 1. Mark as pending delete BEFORE removing — the Firebase listener
+  //    checks this set and won't re-add the item when it next fires.
+  pendingDeletes.add(id);
+
+  // 2. Remove from local state and screen instantly
   delete logs[id];
   saveLocal(logs);
   render();
 
-  // 2. Remove from Firebase unconditionally
+  // 3. Remove from Firebase — once confirmed, listener clears it from pendingDeletes
   if (db) {
-    db.ref('logs/' + id).remove().catch(err => console.error('Delete error:', err));
+    db.ref('logs/' + id).remove().catch(err => {
+      console.error('Delete error:', err);
+      pendingDeletes.delete(id); // rollback if Firebase delete failed
+    });
+  } else {
+    // No Firebase — clear immediately
+    pendingDeletes.delete(id);
   }
 }
 
@@ -525,14 +575,29 @@ function renderDashboard() {
         <div class="row-exp">exp ${fmtTime(expT)}</div>
       </div>`;
 
-    // Delete button — uses addEventListener to avoid quoting issues
+    // Buttons container
+    const btnWrap = document.createElement('div');
+    btnWrap.className = 'row-btns';
+
+    // Edit button
+    const editBtn = document.createElement('button');
+    editBtn.className = 'edit-btn';
+    editBtn.title = 'Edit logged time';
+    editBtn.textContent = '✏';
+    editBtn.addEventListener('click', () => openEditModal(l));
+    btnWrap.appendChild(editBtn);
+
+    // Delete button
     const delBtn = document.createElement('button');
     delBtn.className = 'del-btn';
+    delBtn.title = 'Discard item';
     delBtn.textContent = '✕';
     delBtn.addEventListener('click', () => {
       if (confirm('Mark as discarded and remove?')) deleteLog(l.id);
     });
-    row.appendChild(delBtn);
+    btnWrap.appendChild(delBtn);
+
+    row.appendChild(btnWrap);
     card.appendChild(row);
   });
 
@@ -620,6 +685,75 @@ function closeModal() {
 // Close modal when tapping the dark background (not the modal itself)
 document.getElementById('modal-overlay').addEventListener('click', function(e) {
   if (e.target === this) closeModal();
+});
+
+// ============================================================
+// EDIT DATE/TIME MODAL
+// ============================================================
+let editingLog = null;
+
+function openEditModal(log) {
+  editingLog = log;
+
+  document.getElementById('edit-modal-icon').textContent = CAT_ICONS[log.cat] || '📦';
+  document.getElementById('edit-item-name').textContent  = log.name;
+  document.getElementById('edit-item-sub').textContent   = log.state + ' — tap a time below to correct it';
+
+  // Pre-fill the datetime input with the current logged time
+  const d = new Date(log.loggedAt);
+  // datetime-local needs format: YYYY-MM-DDTHH:MM
+  const pad = n => String(n).padStart(2, '0');
+  const val = d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate())
+            + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+  document.getElementById('edit-datetime').value = val;
+
+  updateEditPreview();
+  document.getElementById('edit-overlay').classList.add('open');
+}
+
+function updateEditPreview() {
+  if (!editingLog) return;
+  const val = document.getElementById('edit-datetime').value;
+  if (!val) return;
+
+  const newLoggedAt = new Date(val).getTime();
+  const expiresAt   = newLoggedAt + editingLog.hours * 3600000;
+  const st          = getStatus(newLoggedAt, editingLog.hours);
+
+  document.getElementById('edit-preview').innerHTML =
+    '<b style="color:var(--text)">Logged:</b>  ' + fmtTime(newLoggedAt) + '<br>' +
+    '<b style="color:var(--text)">Expires:</b> ' + fmtTime(expiresAt) + '<br>' +
+    '<b style="color:' + st.color + '">Status:</b>  ' + st.label;
+}
+
+function saveEdit() {
+  if (!editingLog) return;
+  const val = document.getElementById('edit-datetime').value;
+  if (!val) { alert('Please pick a date and time.'); return; }
+
+  const newLoggedAt = new Date(val).getTime();
+
+  // Update locally
+  logs[editingLog.id].loggedAt = newLoggedAt;
+  saveLocal(logs);
+  render();
+
+  // Update in Firebase
+  if (db) {
+    db.ref('logs/' + editingLog.id + '/loggedAt').set(newLoggedAt)
+      .catch(err => console.error('Edit error:', err));
+  }
+
+  closeEditModal();
+}
+
+function closeEditModal() {
+  document.getElementById('edit-overlay').classList.remove('open');
+  editingLog = null;
+}
+
+document.getElementById('edit-overlay').addEventListener('click', function(e) {
+  if (e.target === this) closeEditModal();
 });
 
 // ============================================================
