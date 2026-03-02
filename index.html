@@ -329,10 +329,6 @@ function initFirebase() {
     firebase.initializeApp(FIREBASE_CONFIG);
     db = firebase.database();
 
-    // ── KEY FIX: enable offline persistence ──────────────────
-    // This makes Firebase cache all writes locally and replay them
-    // the moment connection is restored. Writes NEVER get lost.
-    db.ref('logs').keepSynced(true);
 
     // ── Real-time listener ────────────────────────────────────
     // Fires on page load AND whenever ANY device adds/removes something
